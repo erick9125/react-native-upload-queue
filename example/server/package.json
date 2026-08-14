@@ -1,0 +1,9 @@
+{
+  "name": "upload-queue-example-server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.mjs"
+  }
+}

@@ -1,0 +1,23 @@
+# Security
+
+## Never persist
+
+- access tokens
+- refresh tokens
+- `Authorization` headers
+- cookies
+- passwords
+- the multipart body
+
+Authentication is obtained dynamically via `getAccessToken` on each
+attempt.
+
+## Metadata
+
+Metadata is for small structured values (document type, local ids). The
+default limit is 8 KiB. Do not put file contents or PII blobs there.
+
+## Logging
+
+The default logger is a no-op. Custom loggers should log `uploadId`,
+`status`, and `attempts` only. Do not `console.log(task)`.

@@ -1,0 +1,6 @@
+{
+  "name": "upload-queue-example-app",
+  "private": true,
+  "version": "0.1.0",
+  "main": "App.tsx"
+}

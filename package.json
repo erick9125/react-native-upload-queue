@@ -1,0 +1,90 @@
+{
+  "name": "@erickmorales/react-native-upload-queue",
+  "version": "0.1.0",
+  "description": "A resilient persistent upload queue for React Native with retries, progress tracking, concurrency control, recovery, and pluggable storage and transport adapters.",
+  "type": "module",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "npm run build:esm && npm run build:cjs && node scripts/finalize-build.mjs",
+    "build:esm": "tsc -p tsconfig.build.json",
+    "build:cjs": "tsc -p tsconfig.build.cjs.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:recovery": "vitest run tests/recovery",
+    "test:concurrency": "vitest run tests/concurrency",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "verify:package": "node scripts/verify-package-exports.mjs",
+    "check": "npm run lint && npm run typecheck && npm run test:unit && npm run build && npm run verify:package",
+    "check:full": "npm run lint && npm run typecheck && npm run test && npm run build && npm run verify:package",
+    "prepack": "npm run clean && npm run build",
+    "prepublishOnly": "npm run check:full"
+  },
+  "keywords": [
+    "react-native",
+    "typescript",
+    "upload",
+    "file-upload",
+    "offline-first",
+    "retry",
+    "queue",
+    "sqlite",
+    "network",
+    "resilience",
+    "mobile",
+    "background-tasks",
+    "developer-tools"
+  ],
+  "author": "Erick Morales",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/erick9125/react-native-upload-queue.git"
+  },
+  "bugs": {
+    "url": "https://github.com/erick9125/react-native-upload-queue/issues"
+  },
+  "homepage": "https://github.com/erick9125/react-native-upload-queue#readme",
+  "devDependencies": {
+    "@eslint/js": "^9.32.0",
+    "@types/node": "^22.17.0",
+    "@vitest/coverage-v8": "^3.2.4",
+    "eslint": "^9.32.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^16.3.0",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.38.0",
+    "vitest": "^3.2.4"
+  }
+}
