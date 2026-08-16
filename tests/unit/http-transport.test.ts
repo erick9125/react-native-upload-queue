@@ -4,6 +4,7 @@ import type { FetchLike } from '../../src/adapters/http/http-upload-transport.js
 import { createMemoryUploadStorage } from '../../src/adapters/memory/memory-upload-storage.js';
 import { createUploadQueue } from '../../src/core/queue/upload-queue.js';
 import { createEnqueueInput } from '../helpers/enqueue.js';
+import { buildTestBody } from '../helpers/body.js';
 
 describe('createHttpUploadTransport', () => {
   it('sends a stable Idempotency-Key and a fresh access token on every attempt', async () => {
@@ -27,6 +28,7 @@ describe('createHttpUploadTransport', () => {
     };
 
     const transport = createHttpUploadTransport({
+      buildBody: buildTestBody,
       baseUrl: 'https://api.example.com',
       fetch: fetchImpl,
       getAccessToken: async () => {
@@ -70,6 +72,7 @@ describe('createHttpUploadTransport', () => {
     });
 
     const transport = createHttpUploadTransport({
+      buildBody: buildTestBody,
       baseUrl: 'https://api.example.com',
       fetch: fetchImpl,
     });

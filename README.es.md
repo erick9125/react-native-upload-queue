@@ -10,7 +10,7 @@ Esta librería persiste cada upload en el dispositivo, procesa la cola con concu
 
 | | |
 | ------------- | ----------------------------------------- |
-| Paquete | `@erickmorales/react-native-upload-queue` |
+| Paquete | `@erickmorales91/react-native-upload-queue` |
 | Runtime | React Native / TypeScript (núcleo compatible con Hermes) |
 | Persistencia | SQLite mediante un driver enchufable, más un adaptador en memoria para tests |
 | Transporte | HTTP multipart, un intento por llamada |
@@ -166,7 +166,7 @@ Eso corresponde a versiones posteriores o a la capa de aplicación.
 ## Instalación
 
 ```bash
-npm install @erickmorales/react-native-upload-queue
+npm install @erickmorales91/react-native-upload-queue
 ```
 
 El núcleo **no** depende en runtime de `react-native`, NetInfo ni de un motor SQLite concreto. Por eso el mismo código corre en tests de Node.
@@ -187,7 +187,7 @@ import {
   createUploadQueue,
   createSQLiteUploadStorage,
   createHttpUploadTransport,
-} from '@erickmorales/react-native-upload-queue';
+} from '@erickmorales91/react-native-upload-queue';
 
 const queue = createUploadQueue({
   storage: createSQLiteUploadStorage({
@@ -232,7 +232,7 @@ import {
   createUploadQueue,
   type UploadQueueEvent,
   type UploadTask,
-} from '@erickmorales/react-native-upload-queue';
+} from '@erickmorales91/react-native-upload-queue';
 
 const queue = createUploadQueue({
   storage: createSQLiteUploadStorage({
@@ -447,7 +447,7 @@ El motor solo habla con `UploadStorage`. SQLite es un adaptador, no el motor.
 ### En memoria (tests)
 
 ```ts
-import { createMemoryUploadStorage, createUploadQueue } from '@erickmorales/react-native-upload-queue';
+import { createMemoryUploadStorage, createUploadQueue } from '@erickmorales91/react-native-upload-queue';
 
 const queue = createUploadQueue({
   storage: createMemoryUploadStorage(),
@@ -460,7 +460,7 @@ El adaptador en memoria es un sustituto honesto: un id duplicado falla, un `upda
 ### SQLite (producción)
 
 ```ts
-import { createSQLiteUploadStorage, type SQLiteDriver } from '@erickmorales/react-native-upload-queue';
+import { createSQLiteUploadStorage, type SQLiteDriver } from '@erickmorales91/react-native-upload-queue';
 
 const storage = createSQLiteUploadStorage({
   databaseName: 'uploads.db',
@@ -549,7 +549,7 @@ import NetInfo from '@react-native-community/netinfo';
 import {
   createManualConnectivity,
   createNetInfoConnectivityProvider,
-} from '@erickmorales/react-native-upload-queue';
+} from '@erickmorales91/react-native-upload-queue';
 
 createNetInfoConnectivityProvider({ netInfo: NetInfo });
 

@@ -19,11 +19,15 @@ export function createId(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-export function nowIso(date: Date = new Date()): string {
+/** Takes the date explicitly so callers cannot bypass the injected `Clock`. */
+export function nowIso(date: Date): string {
   return date.toISOString();
 }
 
 export const DEFAULT_METADATA_MAX_BYTES = 8 * 1024;
+
+/** Mirrors the `max_attempts` default in the SQLite schema. */
+export const DEFAULT_MAX_ATTEMPTS = 5;
 
 export function serializeMetadata(
   value: Record<string, unknown> | undefined,
@@ -61,7 +65,14 @@ export function cloneJson<TValue>(value: TValue): TValue {
   return JSON.parse(JSON.stringify(value)) as TValue;
 }
 
-export function parseRetryAfterHeader(value: string | null | undefined): number | undefined {
+/**
+ * `now` is a parameter so the HTTP-date branch honours the injected clock like
+ * everything else, instead of reaching for `Date.now()` and being untestable.
+ */
+export function parseRetryAfterHeader(
+  value: string | null | undefined,
+  now: Date = new Date(),
+): number | undefined {
   if (!value) {
     return undefined;
   }
@@ -73,18 +84,27 @@ export function parseRetryAfterHeader(value: string | null | undefined): number 
 
   const asDate = Date.parse(value);
   if (!Number.isNaN(asDate)) {
-    return Math.max(0, asDate - Date.now());
+    return Math.max(0, asDate - now.getTime());
   }
 
   return undefined;
 }
 
-export function isAbortError(error: unknown): boolean {
-  if (error instanceof Error && error.name === 'AbortError') {
-    return true;
+function hasErrorName(error: unknown, name: string): boolean {
+  if (error instanceof Error) {
+    return error.name === name;
   }
 
-  return typeof error === 'object' && error !== null && 'name' in error && error.name === 'AbortError';
+  // DOMException is not an Error in every runtime, so fall back to duck typing.
+  return typeof error === 'object' && error !== null && 'name' in error && error.name === name;
+}
+
+export function isAbortError(error: unknown): boolean {
+  return hasErrorName(error, 'AbortError');
+}
+
+export function isTimeoutError(error: unknown): boolean {
+  return hasErrorName(error, 'TimeoutError');
 }
 
 export function clampProgress(progress: number): number {

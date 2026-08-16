@@ -95,6 +95,12 @@ export function createFakeSQLiteDriver(): SQLiteDriver & { dump(): StoredRow[] }
       return { rows: [], rowsAffected: 1 };
     }
 
+    if (normalized.startsWith('select * from upload_queue where id = ? and processing_token = ?')) {
+      const row = rows.get(String(params[0]));
+      const owned = row && row.processing_token === String(params[1]);
+      return { rows: owned ? [cloneRow(row)] : [] };
+    }
+
     if (normalized.startsWith('select * from upload_queue where id = ?')) {
       const row = rows.get(String(params[0]));
       return { rows: row ? [cloneRow(row)] : [] };
@@ -119,8 +125,22 @@ export function createFakeSQLiteDriver(): SQLiteDriver & { dump(): StoredRow[] }
       return { rows: pending };
     }
 
-    if (normalized.includes("where status = 'uploading'")) {
+    if (normalized.startsWith('select min(next_attempt_at)')) {
+      let earliest: string | null = null;
+      for (const row of rows.values()) {
+        if (row.status !== 'pending' || row.next_attempt_at == null) {
+          continue;
+        }
+        if (earliest === null || row.next_attempt_at < earliest) {
+          earliest = row.next_attempt_at;
+        }
+      }
+      return { rows: [{ earliest }] };
+    }
+
+    if (normalized.startsWith('select * from upload_queue') && normalized.includes("status = 'uploading'")) {
       const staleBefore = String(params[0]);
+      const limit = Number(params[1] ?? Number.MAX_SAFE_INTEGER);
       const recoverable = [...rows.values()]
         .filter(
           (row) =>
@@ -128,8 +148,56 @@ export function createFakeSQLiteDriver(): SQLiteDriver & { dump(): StoredRow[] }
             row.processing_started_at != null &&
             row.processing_started_at <= staleBefore,
         )
+        .sort((left, right) =>
+          String(left.processing_started_at).localeCompare(String(right.processing_started_at)),
+        )
+        .slice(0, limit)
         .map(cloneRow);
       return { rows: recoverable };
+    }
+
+    if (normalized.startsWith("update upload_queue set status = 'pending'")) {
+      const updatedAt = String(params[0]);
+      const staleBefore = String(params[1]);
+      let recovered = 0;
+      for (const row of rows.values()) {
+        if (
+          row.status !== 'uploading' ||
+          row.processing_started_at == null ||
+          row.processing_started_at > staleBefore
+        ) {
+          continue;
+        }
+
+        row.status = 'pending';
+        row.updated_at = updatedAt;
+        row.progress = 0;
+        row.processing_token = null;
+        row.processing_started_at = null;
+        row.next_attempt_at = null;
+        recovered += 1;
+      }
+      return { rows: [], rowsAffected: recovered };
+    }
+
+    if (normalized.startsWith('update upload_queue set progress = ?')) {
+      const id = String(params[4]);
+      const current = rows.get(id);
+      if (
+        !current ||
+        current.status !== 'uploading' ||
+        current.processing_token !== String(params[5])
+      ) {
+        return { rows: [], rowsAffected: 0 };
+      }
+
+      current.progress = Number(params[0]);
+      current.bytes_uploaded = params[1] == null ? null : Number(params[1]);
+      if (params[2] != null) {
+        current.total_bytes = Number(params[2]);
+      }
+      current.updated_at = String(params[3]);
+      return { rows: [], rowsAffected: 1 };
     }
 
     if (normalized.startsWith('select * from upload_queue order by created_at')) {
@@ -142,8 +210,13 @@ export function createFakeSQLiteDriver(): SQLiteDriver & { dump(): StoredRow[] }
 
     if (normalized.startsWith("update upload_queue set status = 'uploading'")) {
       const id = String(params[4]);
+      const nowIso = String(params[5]);
       const current = rows.get(id);
       if (!current || current.status !== 'pending') {
+        return { rows: [], rowsAffected: 0 };
+      }
+
+      if (current.next_attempt_at != null && current.next_attempt_at > nowIso) {
         return { rows: [], rowsAffected: 0 };
       }
 
@@ -163,6 +236,13 @@ export function createFakeSQLiteDriver(): SQLiteDriver & { dump(): StoredRow[] }
       const current = rows.get(id);
       if (!current) {
         return { rows: [], rowsAffected: 0 };
+      }
+
+      // Fenced variant: `... WHERE id = ? AND processing_token = ?`.
+      if (normalized.endsWith('and processing_token = ?')) {
+        if (current.processing_token !== String(params[24])) {
+          return { rows: [], rowsAffected: 0 };
+        }
       }
 
       current.file_uri = String(params[0]);
@@ -221,13 +301,31 @@ export function createFakeSQLiteDriver(): SQLiteDriver & { dump(): StoredRow[] }
     throw new Error(`Unsupported SQL in fake driver: ${sql}`);
   };
 
-  return {
+  let transactionDepth = 0;
+
+  const driver: SQLiteDriver & { dump(): StoredRow[] } = {
     execute,
+    /**
+     * Mirrors what a real single-connection SQLite driver does: a bare BEGIN
+     * inside an open transaction is an error. Without this the fake silently
+     * tolerated overlapping transactions that blow up on a real engine.
+     */
     async transaction<T>(fn: (tx: SQLiteDriver) => Promise<T>): Promise<T> {
-      return fn({ execute, transaction: this.transaction });
+      if (transactionDepth > 0) {
+        throw new Error('cannot start a transaction within a transaction');
+      }
+
+      transactionDepth += 1;
+      try {
+        return await fn(driver);
+      } finally {
+        transactionDepth -= 1;
+      }
     },
     dump(): StoredRow[] {
       return [...rows.values()].map(cloneRow);
     },
   };
+
+  return driver;
 }

@@ -7,7 +7,7 @@ import {
   createUploadQueue,
   type UploadQueueEvent,
   type UploadTask,
-} from '@erickmorales/react-native-upload-queue';
+} from '@erickmorales91/react-native-upload-queue';
 
 const connectivity = createManualConnectivity(true);
 

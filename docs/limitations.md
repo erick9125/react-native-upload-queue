@@ -22,3 +22,17 @@ Not included:
 409 Conflict is treated as a non-retryable validation failure. If your
 API uses 409 differently, handle it in a custom transport/classifier
 later.
+
+401 and 401's sibling 403 both park the upload in `blocked` rather than
+`failed`: neither can be resolved by retrying on the same credentials, so
+they wait for the host to refresh the token or fix permissions, then
+`retry()`.
+
+## Outside React Native
+
+The default multipart body only works in React Native, whose networking
+layer streams `file://` URIs natively. Anywhere else — Node, web, tests —
+pass `createHttpUploadTransport({ buildBody })` and build the body
+yourself. The builder throws rather than guessing; it used to put the URI
+*string* in the request body, which uploaded a few dozen bytes and got a
+200 back.

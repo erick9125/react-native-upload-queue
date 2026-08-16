@@ -1,7 +1,7 @@
 import type { UploadError } from '../../core/models/upload-error.js';
 import type { UploadHttpMethod, UploadTask } from '../../core/models/upload-task.js';
 import type { UploadStatus } from '../../core/models/upload-status.js';
-import { cloneJson } from '../../core/utils.js';
+import { cloneJson, DEFAULT_MAX_ATTEMPTS } from '../../core/utils.js';
 
 export interface UploadQueueRow {
   readonly id: string;
@@ -71,7 +71,9 @@ export function mapUploadRow(row: Record<string, unknown>): UploadTask {
     method: String(row.method) as UploadHttpMethod,
     status: String(row.status) as UploadStatus,
     attempts: Number(row.attempts ?? 0),
-    maxAttempts: Number(row.max_attempts ?? 0),
+    // Falls back to the schema default, not 0. Zero would make `attempts <
+    // maxAttempts` false forever, silently disabling retries for the row.
+    maxAttempts: Number(row.max_attempts ?? DEFAULT_MAX_ATTEMPTS),
     idempotencyKey: String(row.idempotency_key),
     progress: Number(row.progress ?? 0),
     createdAt: String(row.created_at),
