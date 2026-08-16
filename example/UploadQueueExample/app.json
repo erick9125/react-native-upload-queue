@@ -1,0 +1,26 @@
+{
+  "expo": {
+    "name": "Upload Queue Example",
+    "slug": "upload-queue-example",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.example.uploadqueue"
+    },
+    "android": {
+      "package": "com.example.uploadqueue"
+    },
+    "plugins": [
+      "expo-sqlite",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "This example uploads a photo you choose so you can watch the queue work."
+        }
+      ]
+    ]
+  }
+}
