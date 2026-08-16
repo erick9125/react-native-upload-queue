@@ -8,8 +8,7 @@ import type { RetryConfig, RetryStrategy } from '../contracts/retry-strategy.js'
 import type { UploadStorage } from '../contracts/upload-storage.js';
 import type { UploadTransport } from '../contracts/upload-transport.js';
 import { UploadEventEmitter, type UploadEventListener } from '../events/upload-event-emitter.js';
-import type { UploadProcessResult } from '../models/upload-result.js';
-import type { UploadStatus } from '../models/upload-status.js';
+import type { UploadProcessResult, UploadSkipReason } from '../models/upload-result.js';
 import type { EnqueueUploadInput, UploadTask } from '../models/upload-task.js';
 import { UploadErrorClassifier } from '../processor/upload-error-classifier.js';
 import { UploadProcessor } from '../processor/upload-processor.js';
@@ -19,9 +18,10 @@ import { cloneTask } from '../task.js';
 import { createId, DEFAULT_METADATA_MAX_BYTES, nowIso, serializeMetadata } from '../utils.js';
 import { FileNotFoundError } from '../../errors/file-not-found.error.js';
 import { UploadNotFoundError } from '../../errors/upload-not-found.error.js';
-import { ConcurrencyController } from './concurrency-controller.js';
 import { QueueCoordinator } from './queue-coordinator.js';
+import { QueueRunner } from './queue-runner.js';
 import { UploadStateMachine } from './upload-state-machine.js';
+import { WakeScheduler } from './wake-scheduler.js';
 
 export interface UploadQueueRecoveryOptions {
   readonly processingTimeoutMs?: number;
@@ -94,9 +94,7 @@ function resolveRetryStrategy(config: RetryConfig = {}): RetryStrategy {
   });
 }
 
-function emptyResult(
-  reason?: UploadProcessResult['reason'],
-): UploadProcessResult {
+function skippedResult(reason: UploadSkipReason): UploadProcessResult {
   return {
     processed: 0,
     completed: 0,
@@ -104,8 +102,22 @@ function emptyResult(
     blocked: 0,
     deferred: 0,
     cancelled: 0,
-    skipped: reason !== undefined,
-    ...(reason !== undefined ? { reason } : {}),
+    errored: 0,
+    skipped: true,
+    reason,
+  };
+}
+
+function mergeResults(left: UploadProcessResult, right: UploadProcessResult): UploadProcessResult {
+  return {
+    processed: left.processed + right.processed,
+    completed: left.completed + right.completed,
+    failed: left.failed + right.failed,
+    blocked: left.blocked + right.blocked,
+    deferred: left.deferred + right.deferred,
+    cancelled: left.cancelled + right.cancelled,
+    errored: left.errored + right.errored,
+    skipped: left.skipped && right.skipped,
   };
 }
 
@@ -126,9 +138,18 @@ export function createUploadQueue(options: UploadQueueOptions): UploadQueue {
 
   let initialization: Promise<void> | undefined;
   let started = false;
-  let wakeTimer: ReturnType<typeof setTimeout> | undefined;
+  let shuttingDown = false;
   let unsubscribeConnectivity: (() => void) | undefined;
   let wasOffline = false;
+  /**
+   * Set when a process() call arrives while a drain is already running. Work
+   * enqueued in that window is invisible to the running pass if it happens to be
+   * past its last getPending(), and a freshly enqueued upload has no
+   * nextAttemptAt for the wake timer to fire on — so it would sit untouched
+   * until the next external trigger. The running pass consumes this flag and
+   * takes another lap instead.
+   */
+  let rerunRequested = false;
 
   const getAbortSignal = (uploadId: string): AbortSignal => {
     const existing = controllers.get(uploadId);
@@ -148,6 +169,30 @@ export function createUploadQueue(options: UploadQueueOptions): UploadQueue {
     }
   };
 
+  const abortAll = (): void => {
+    for (const controller of controllers.values()) {
+      if (!controller.signal.aborted) {
+        controller.abort();
+      }
+    }
+  };
+
+  /**
+   * Fire-and-forget processing that can never surface as an unhandled rejection.
+   * Every background trigger (enqueue, resume, retry, wake timer, reconnect)
+   * goes through here; a rejected process() must not take the app down.
+   */
+  const triggerProcess = (): void => {
+    void queue
+      .process()
+      .then(() => scheduleWake())
+      .catch((error: unknown) => {
+        logger.error('background processing failed', {
+          message: error instanceof Error ? error.message : 'unknown',
+        });
+      });
+  };
+
   const processor = new UploadProcessor({
     storage,
     transport: options.transport,
@@ -159,6 +204,7 @@ export function createUploadQueue(options: UploadQueueOptions): UploadQueue {
     emit: (event) => emitter.emit(event),
     getAbortSignal,
     isOnline: async () => (options.connectivity ? options.connectivity.isOnline() : true),
+    isShuttingDown: () => shuttingDown,
     progressEventThrottleMs: options.progress?.eventThrottleMs ?? 200,
     persistEveryPercent: options.progress?.persistEveryPercent ?? 0.1,
     persistEveryMs: options.progress?.persistEveryMs ?? 500,
@@ -174,28 +220,9 @@ export function createUploadQueue(options: UploadQueueOptions): UploadQueue {
 
   const recoverAbandoned = async (): Promise<number> => {
     const staleBefore = new Date(clock.now().getTime() - processingTimeoutMs).toISOString();
-    const abandoned = await storage.getRecoverable(staleBefore);
-    const updatedAt = nowIso(clock.now());
-    let recovered = 0;
-
-    for (const task of abandoned) {
-      if (!stateMachine.canTransition(task.status, 'pending')) {
-        continue;
-      }
-
-      await storage.update(
-        cloneTask(
-          task,
-          {
-            status: 'pending',
-            updatedAt,
-            progress: 0,
-          },
-          ['processingToken', 'processingStartedAt', 'nextAttemptAt'],
-        ),
-      );
-      recovered += 1;
-    }
+    // `uploading -> pending` is always a legal transition, so this needs no
+    // per-row state check and collapses into a single statement.
+    const recovered = await storage.recoverAbandoned(staleBefore, nowIso(clock.now()));
 
     if (recovered > 0) {
       logger.info('recovered abandoned uploads', { recovered });
@@ -204,128 +231,38 @@ export function createUploadQueue(options: UploadQueueOptions): UploadQueue {
     return recovered;
   };
 
+  const scheduler = new WakeScheduler({
+    clock,
+    getEarliestNextAttemptAt: () => storage.getEarliestNextAttemptAt(),
+    onWake: () => triggerProcess(),
+  });
+
   const scheduleWake = async (): Promise<void> => {
-    if (wakeTimer) {
-      clearTimeout(wakeTimer);
-      wakeTimer = undefined;
-    }
-
     if (!started) {
+      scheduler.cancel();
       return;
     }
 
-    const tasks = await storage.list();
-    let earliest: number | undefined;
-
-    for (const task of tasks) {
-      if (task.status !== 'pending' || !task.nextAttemptAt) {
-        continue;
-      }
-
-      const at = Date.parse(task.nextAttemptAt);
-      if (Number.isNaN(at)) {
-        continue;
-      }
-
-      earliest = earliest === undefined ? at : Math.min(earliest, at);
-    }
-
-    if (earliest === undefined) {
-      return;
-    }
-
-    const delayMs = Math.max(0, earliest - clock.now().getTime());
-    wakeTimer = setTimeout(() => {
-      void queue.process().then(() => scheduleWake());
-    }, delayMs);
+    await scheduler.schedule();
   };
 
-  const processPending = async (): Promise<UploadProcessResult> => {
-    if (options.connectivity && !(await options.connectivity.isOnline())) {
-      logger.info('upload processing skipped', { reason: 'offline' });
-      return emptyResult('offline');
-    }
-
-    const concurrency = new ConcurrencyController(concurrencyLimit);
-    const inFlight = new Map<string, Promise<UploadStatus>>();
-    let processed = 0;
-    let completed = 0;
-    let failed = 0;
-    let blocked = 0;
-    let deferred = 0;
-    let cancelled = 0;
-
-    const record = (status: UploadStatus): void => {
-      processed += 1;
-      if (status === 'completed') {
-        completed += 1;
-      } else if (status === 'failed') {
-        failed += 1;
-      } else if (status === 'blocked') {
-        blocked += 1;
-      } else if (status === 'cancelled') {
-        cancelled += 1;
-      } else {
-        deferred += 1;
-      }
-    };
-
-    const launch = (task: UploadTask): void => {
-      if (!concurrency.tryAcquire()) {
-        return;
-      }
-
-      const promise = processor
-        .process(task)
-        .then((status) => {
-          record(status);
-          return status;
-        })
-        .finally(() => {
-          concurrency.release();
-          inFlight.delete(task.id);
-          controllers.delete(task.id);
-        });
-
-      inFlight.set(task.id, promise);
-    };
-
-    for (;;) {
-      if (options.connectivity && !(await options.connectivity.isOnline())) {
-        break;
-      }
-
-      while (concurrency.remaining > 0) {
-        const pending = await storage.getPending(concurrency.remaining, nowIso(clock.now()));
-        const next = pending.filter((task) => !inFlight.has(task.id));
-        if (next.length === 0) {
-          break;
-        }
-
-        for (const task of next) {
-          launch(task);
-        }
-      }
-
-      if (inFlight.size === 0) {
-        break;
-      }
-
-      await Promise.race(inFlight.values());
-    }
-
-    await Promise.all(inFlight.values());
-
-    return {
-      processed,
-      completed,
-      failed,
-      blocked,
-      deferred,
-      cancelled,
-      skipped: false,
-    };
-  };
+  const runner = new QueueRunner({
+    storage,
+    processor,
+    clock,
+    logger,
+    concurrencyLimit,
+    isOnline: async () => (options.connectivity ? options.connectivity.isOnline() : true),
+    isShuttingDown: () => shuttingDown,
+    consumeRerunRequest: () => {
+      const requested = rerunRequested;
+      rerunRequested = false;
+      return requested;
+    },
+    onSettled: (uploadId: string) => {
+      controllers.delete(uploadId);
+    },
+  });
 
   const queue: UploadQueue = {
     async initialize(): Promise<void> {
@@ -344,11 +281,7 @@ export function createUploadQueue(options: UploadQueueOptions): UploadQueue {
                 return;
               }
 
-              void queue.process().catch((error: unknown) => {
-                logger.error('automatic process after reconnect failed', {
-                  message: error instanceof Error ? error.message : 'unknown',
-                });
-              });
+              triggerProcess();
             });
           }
         } catch (error) {
@@ -362,7 +295,9 @@ export function createUploadQueue(options: UploadQueueOptions): UploadQueue {
 
     async enqueue(input: EnqueueUploadInput): Promise<UploadTask> {
       await queue.initialize();
-      serializeMetadata(input.metadata, metadataMaxBytes);
+      // Validates size and JSON-serializability once, and the result doubles as
+      // the defensive copy instead of a second stringify/parse round trip.
+      const serializedMetadata = serializeMetadata(input.metadata, metadataMaxBytes);
 
       const createdAt = nowIso(clock.now());
       const task: UploadTask = cloneTask(
@@ -383,7 +318,9 @@ export function createUploadQueue(options: UploadQueueOptions): UploadQueue {
         {
           ...(input.mimeType !== undefined ? { mimeType: input.mimeType } : {}),
           ...(input.size !== undefined ? { size: input.size } : {}),
-          ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
+          ...(serializedMetadata !== undefined
+            ? { metadata: JSON.parse(serializedMetadata) as Record<string, unknown> }
+            : {}),
         },
       );
 
@@ -396,7 +333,7 @@ export function createUploadQueue(options: UploadQueueOptions): UploadQueue {
       });
 
       if (started) {
-        void queue.process().then(() => scheduleWake());
+        triggerProcess();
       }
 
       return task;
@@ -409,23 +346,46 @@ export function createUploadQueue(options: UploadQueueOptions): UploadQueue {
       await scheduleWake();
     },
 
+    /**
+     * Aborts every in-flight attempt and waits for the batch to unwind before
+     * returning, so callers can safely tear down storage afterwards. Uploads
+     * interrupted this way go back to `pending` without burning an attempt.
+     */
     async stop(): Promise<void> {
       started = false;
-      if (wakeTimer) {
-        clearTimeout(wakeTimer);
-        wakeTimer = undefined;
+      scheduler.cancel();
+
+      shuttingDown = true;
+      try {
+        abortAll();
+        await runner.drain();
+      } finally {
+        shuttingDown = false;
+        controllers.clear();
       }
     },
 
     async process(): Promise<UploadProcessResult> {
       await queue.initialize();
 
-      const exclusive = await coordinator.runExclusive(processPending);
-      if (!exclusive.ran) {
-        return emptyResult('busy');
-      }
+      let aggregate: UploadProcessResult | undefined;
+      for (;;) {
+        const exclusive = await coordinator.runExclusive(() => runner.run());
+        if (!exclusive.ran) {
+          // Another pass owns the queue. Ask it to take one more lap so the work
+          // we were called for is not left behind, and report busy.
+          rerunRequested = true;
+          return aggregate ?? skippedResult('busy');
+        }
 
-      return exclusive.result;
+        aggregate = aggregate ? mergeResults(aggregate, exclusive.result) : exclusive.result;
+
+        // Set in the gap between the drain finishing and the lock being released,
+        // which the in-loop check above cannot see.
+        if (!rerunRequested) {
+          return aggregate;
+        }
+      }
     },
 
     async pause(uploadId: string): Promise<UploadTask> {
@@ -471,7 +431,7 @@ export function createUploadQueue(options: UploadQueueOptions): UploadQueue {
       await storage.update(updated);
 
       if (started) {
-        void queue.process().then(() => scheduleWake());
+        triggerProcess();
       }
 
       return updated;
@@ -523,7 +483,7 @@ export function createUploadQueue(options: UploadQueueOptions): UploadQueue {
       await storage.update(updated);
 
       if (started) {
-        void queue.process().then(() => scheduleWake());
+        triggerProcess();
       }
 
       return updated;

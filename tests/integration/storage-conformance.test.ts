@@ -3,6 +3,7 @@ import { createMemoryUploadStorage } from '../../src/adapters/memory/memory-uplo
 import { createSQLiteUploadStorage } from '../../src/adapters/sqlite/sqlite-upload-storage.js';
 import type { UploadStorage } from '../../src/core/contracts/upload-storage.js';
 import type { UploadTask } from '../../src/core/models/upload-task.js';
+import { cloneTask } from '../../src/core/task.js';
 import { createFakeSQLiteDriver } from '../helpers/fake-sqlite-driver.js';
 import { createRealSQLiteDriver } from '../helpers/node-sqlite-driver.js';
 
@@ -112,6 +113,64 @@ describe.each(storageSuites())('$name', ({ create }) => {
     expect(second).toBeNull();
   });
 
+  it('refuses a fenced write from a worker that lost its claim', async () => {
+    const storage = await create();
+    await storage.initialize();
+    await storage.insert(sampleTask());
+
+    const claimedByA = await storage.claim('upload-1', 'token-a', '2026-08-13T15:00:05.000Z');
+    expect(claimedByA?.processingToken).toBe('token-a');
+
+    // Recovery hands the upload back to the pool and worker B picks it up.
+    await storage.update(
+      cloneTask(claimedByA!, { status: 'pending' }, ['processingToken', 'processingStartedAt']),
+    );
+    const claimedByB = await storage.claim('upload-1', 'token-b', '2026-08-13T15:00:06.000Z');
+    expect(claimedByB?.processingToken).toBe('token-b');
+
+    // Worker A wakes up holding its pre-upload snapshot and tries to finish.
+    const landed = await storage.updateOwned(
+      cloneTask(claimedByA!, { status: 'completed', progress: 1, remoteId: 'stale-worker' }),
+      'token-a',
+    );
+
+    expect(landed).toBe(false);
+    const final = await storage.get('upload-1');
+    expect(final?.status).toBe('uploading');
+    expect(final?.processingToken).toBe('token-b');
+    expect(final?.remoteId).toBeUndefined();
+  });
+
+  it('accepts a fenced write from the worker that still holds the claim', async () => {
+    const storage = await create();
+    await storage.initialize();
+    await storage.insert(sampleTask());
+
+    const claimed = await storage.claim('upload-1', 'token-a', '2026-08-13T15:00:05.000Z');
+    const landed = await storage.updateOwned(
+      cloneTask(claimed!, { status: 'completed', progress: 1, remoteId: 'remote-7' }, [
+        'processingToken',
+        'processingStartedAt',
+      ]),
+      'token-a',
+    );
+
+    expect(landed).toBe(true);
+    const final = await storage.get('upload-1');
+    expect(final?.status).toBe('completed');
+    expect(final?.remoteId).toBe('remote-7');
+  });
+
+  it('does not claim an upload whose retry is still in the future', async () => {
+    const storage = await create();
+    await storage.initialize();
+    await storage.insert(sampleTask({ nextAttemptAt: '2026-08-13T16:00:00.000Z' }));
+
+    const claimed = await storage.claim('upload-1', 'token-a', '2026-08-13T15:00:05.000Z');
+    expect(claimed).toBeNull();
+    expect((await storage.get('upload-1'))?.status).toBe('pending');
+  });
+
   it('deletes completed rows', async () => {
     const storage = await create();
     await storage.initialize();
@@ -121,11 +180,18 @@ describe.each(storageSuites())('$name', ({ create }) => {
   });
 });
 
-describe('SQLiteUploadStorage with node:sqlite', () => {
-  it('persists through a real engine when available', async () => {
+// Availability is decided up front so an unavailable engine reports as skipped
+// rather than as a passing test that quietly returned without asserting anything.
+const hasNodeSqlite = await import('node:sqlite').then(
+  () => true,
+  () => false,
+);
+
+describe.skipIf(!hasNodeSqlite)('SQLiteUploadStorage with node:sqlite', () => {
+  it('persists through a real engine', async () => {
     const handle = await createRealSQLiteDriver();
     if (!handle) {
-      return;
+      throw new Error('node:sqlite reported available but the driver could not be created');
     }
 
     const storage = createSQLiteUploadStorage({ driver: handle.driver });

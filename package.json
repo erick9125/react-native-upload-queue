@@ -1,5 +1,5 @@
 {
-  "name": "@erickmorales/react-native-upload-queue",
+  "name": "@erickmorales91/react-native-upload-queue",
   "version": "0.1.0",
   "description": "A resilient persistent upload queue for React Native with retries, progress tracking, concurrency control, recovery, and pluggable storage and transport adapters.",
   "type": "module",
@@ -21,7 +21,6 @@
   },
   "files": [
     "dist",
-    "src",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
@@ -43,7 +42,7 @@
     "format": "prettier --write .",
     "verify:package": "node scripts/verify-package-exports.mjs",
     "check": "npm run lint && npm run typecheck && npm run test:unit && npm run build && npm run verify:package",
-    "check:full": "npm run lint && npm run typecheck && npm run test && npm run build && npm run verify:package",
+    "check:full": "npm run lint && npm run typecheck && npm run test:coverage && npm run build && npm run verify:package",
     "prepack": "npm run clean && npm run build",
     "prepublishOnly": "npm run check:full"
   },

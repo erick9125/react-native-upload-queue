@@ -3,65 +3,36 @@ import type { UploadTask } from '../../core/models/upload-task.js';
 import { UploadNotFoundError } from '../../errors/upload-not-found.error.js';
 import { UploadQueueError } from '../../errors/upload-queue.error.js';
 import type { SQLiteDriver, SQLiteUploadStorageOptions } from './driver.js';
-import { CREATE_INDEXES, CREATE_META_TABLE, CREATE_UPLOAD_QUEUE_TABLE, SCHEMA_VERSION } from './migrations.js';
-import { mapUploadRow, serializeError, serializeMetadataValue } from './upload-row-mapper.js';
+import { applyMigrations } from './migrations.js';
+import { mapUploadRow } from './upload-row-mapper.js';
+import {
+  INSERT_SQL,
+  insertParams,
+  UPDATE_OWNED_SQL,
+  UPDATE_SQL,
+  updateParams,
+} from './upload-columns.js';
 
-async function ensureSchema(driver: SQLiteDriver): Promise<void> {
-  await driver.execute(CREATE_META_TABLE);
-  await driver.execute(CREATE_UPLOAD_QUEUE_TABLE);
-  for (const statement of CREATE_INDEXES) {
-    await driver.execute(statement);
+/**
+ * Progress is the hottest write in the library — a few times per second per
+ * upload. It touches four columns and never re-serializes metadata or the last
+ * error, unlike the full-row UPDATE above.
+ */
+const UPDATE_PROGRESS_SQL = `UPDATE upload_queue
+SET progress = ?, bytes_uploaded = ?, total_bytes = COALESCE(?, total_bytes), updated_at = ?
+WHERE id = ? AND processing_token = ? AND status = 'uploading'`;
+
+/** Recovery is a diagnostic read; cap it so a corrupt queue cannot exhaust memory. */
+const DEFAULT_RECOVERABLE_LIMIT = 500;
+
+/** Wording differs across SQLite bindings, so match on the shared vocabulary. */
+function isUniqueViolation(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
   }
 
-  const versionResult = await driver.execute(`SELECT value FROM upload_meta WHERE key = ? LIMIT 1`, [
-    'schema_version',
-  ]);
-  const currentVersion = Number(versionResult.rows[0]?.value ?? 0);
-
-  if (currentVersion < SCHEMA_VERSION) {
-    await driver.execute(
-      `INSERT INTO upload_meta (key, value) VALUES (?, ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-      ['schema_version', String(SCHEMA_VERSION)],
-    );
-  }
-}
-
-const UPDATE_SQL = `UPDATE upload_queue
-SET file_uri = ?, file_name = ?, mime_type = ?, file_size = ?, destination = ?, method = ?,
-    status = ?, attempts = ?, max_attempts = ?, idempotency_key = ?, progress = ?,
-    bytes_uploaded = ?, total_bytes = ?, metadata = ?, last_error = ?, created_at = ?,
-    updated_at = ?, next_attempt_at = ?, started_at = ?, completed_at = ?,
-    processing_token = ?, processing_started_at = ?, remote_id = ?
-WHERE id = ?`;
-
-function updateParams(task: UploadTask): unknown[] {
-  return [
-    task.fileUri,
-    task.fileName,
-    task.mimeType ?? null,
-    task.size ?? null,
-    task.destination,
-    task.method,
-    task.status,
-    task.attempts,
-    task.maxAttempts,
-    task.idempotencyKey,
-    task.progress,
-    task.bytesUploaded ?? null,
-    task.totalBytes ?? null,
-    serializeMetadataValue(task.metadata),
-    serializeError(task.lastError),
-    task.createdAt,
-    task.updatedAt,
-    task.nextAttemptAt ?? null,
-    task.startedAt ?? null,
-    task.completedAt ?? null,
-    task.processingToken ?? null,
-    task.processingStartedAt ?? null,
-    task.remoteId ?? null,
-    task.id,
-  ];
+  const message = error.message.toLowerCase();
+  return message.includes('unique') || message.includes('primary key');
 }
 
 export function createSQLiteUploadStorage(options: SQLiteUploadStorageOptions): UploadStorage {
@@ -89,7 +60,7 @@ export function createSQLiteUploadStorage(options: SQLiteUploadStorageOptions): 
 
   const ensureReady = async (): Promise<SQLiteDriver> => {
     const driver = await resolveDriver();
-    schemaPromise ??= ensureSchema(driver).catch((error: unknown) => {
+    schemaPromise ??= applyMigrations(driver).then(() => undefined).catch((error: unknown) => {
       schemaPromise = undefined;
       throw error;
     });
@@ -105,50 +76,21 @@ export function createSQLiteUploadStorage(options: SQLiteUploadStorageOptions): 
     async insert(task: UploadTask): Promise<void> {
       const driver = await ensureReady();
       try {
-        await driver.execute(
-          `INSERT INTO upload_queue (
-            id, file_uri, file_name, mime_type, file_size, destination, method, status,
-            attempts, max_attempts, idempotency_key, progress, bytes_uploaded, total_bytes,
-            metadata, last_error, created_at, updated_at, next_attempt_at, started_at,
-            completed_at, processing_token, processing_started_at, remote_id
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            task.id,
-            task.fileUri,
-            task.fileName,
-            task.mimeType ?? null,
-            task.size ?? null,
-            task.destination,
-            task.method,
-            task.status,
-            task.attempts,
-            task.maxAttempts,
-            task.idempotencyKey,
-            task.progress,
-            task.bytesUploaded ?? null,
-            task.totalBytes ?? null,
-            serializeMetadataValue(task.metadata),
-            serializeError(task.lastError),
-            task.createdAt,
-            task.updatedAt,
-            task.nextAttemptAt ?? null,
-            task.startedAt ?? null,
-            task.completedAt ?? null,
-            task.processingToken ?? null,
-            task.processingStartedAt ?? null,
-            task.remoteId ?? null,
-          ],
-        );
+        await driver.execute(INSERT_SQL, insertParams(task));
       } catch (error) {
-        const existing = await adapter.get(task.id);
-        if (existing) {
-          throw new UploadQueueError({
-            kind: 'validation',
-            message: `Upload ${task.id} is already queued`,
-            retryable: false,
-          });
+        // Only a constraint violation is treated as a duplicate. Probing with a
+        // SELECT after *any* driver error used to report disk and IO faults as
+        // "already queued", hiding the real problem.
+        if (!isUniqueViolation(error)) {
+          throw error;
         }
-        throw error;
+
+        throw new UploadQueueError({
+          kind: 'validation',
+          message: `Upload ${task.id} is already queued`,
+          retryable: false,
+          cause: error,
+        });
       }
     },
 
@@ -158,6 +100,28 @@ export function createSQLiteUploadStorage(options: SQLiteUploadStorageOptions): 
       if (result.rowsAffected === 0) {
         throw new UploadNotFoundError(task.id);
       }
+    },
+
+    async updateOwned(task: UploadTask, processingToken: string): Promise<boolean> {
+      const driver = await ensureReady();
+      const result = await driver.execute(UPDATE_OWNED_SQL, [
+        ...updateParams(task),
+        processingToken,
+      ]);
+      return (result.rowsAffected ?? 0) > 0;
+    },
+
+    async updateProgress(update): Promise<boolean> {
+      const driver = await ensureReady();
+      const result = await driver.execute(UPDATE_PROGRESS_SQL, [
+        update.progress,
+        update.bytesUploaded,
+        update.totalBytes ?? null,
+        update.updatedAt,
+        update.id,
+        update.processingToken,
+      ]);
+      return (result.rowsAffected ?? 0) > 0;
     },
 
     async get(id: string): Promise<UploadTask | null> {
@@ -180,19 +144,58 @@ export function createSQLiteUploadStorage(options: SQLiteUploadStorageOptions): 
       return result.rows.map((row) => mapUploadRow(row));
     },
 
-    async getRecoverable(staleBeforeIso: string): Promise<readonly UploadTask[]> {
+    async getRecoverable(
+      staleBeforeIso: string,
+      limit = DEFAULT_RECOVERABLE_LIMIT,
+    ): Promise<readonly UploadTask[]> {
       const driver = await ensureReady();
       const result = await driver.execute(
         `SELECT * FROM upload_queue
          WHERE status = 'uploading'
            AND processing_started_at IS NOT NULL
            AND processing_started_at <= ?
-         ORDER BY processing_started_at ASC`,
-        [staleBeforeIso],
+         ORDER BY processing_started_at ASC
+         LIMIT ?`,
+        [staleBeforeIso, limit],
       );
       return result.rows.map((row) => mapUploadRow(row));
     },
 
+    async recoverAbandoned(staleBeforeIso: string, updatedAt: string): Promise<number> {
+      const driver = await ensureReady();
+      const result = await driver.execute(
+        `UPDATE upload_queue
+         SET status = 'pending',
+             updated_at = ?,
+             progress = 0,
+             processing_token = NULL,
+             processing_started_at = NULL,
+             next_attempt_at = NULL
+         WHERE status = 'uploading'
+           AND processing_started_at IS NOT NULL
+           AND processing_started_at <= ?`,
+        [updatedAt, staleBeforeIso],
+      );
+      return result.rowsAffected ?? 0;
+    },
+
+    async getEarliestNextAttemptAt(): Promise<string | null> {
+      const driver = await ensureReady();
+      const result = await driver.execute(
+        `SELECT MIN(next_attempt_at) AS earliest FROM upload_queue
+         WHERE status = 'pending' AND next_attempt_at IS NOT NULL`,
+      );
+      const earliest = result.rows[0]?.earliest;
+      return earliest == null ? null : String(earliest);
+    },
+
+    /**
+     * Compare-and-set claim. A single conditional UPDATE is already atomic in
+     * SQLite, so this deliberately avoids an explicit transaction: claims run
+     * concurrently whenever `concurrency > 1`, and drivers that map
+     * `transaction()` onto plain BEGIN/COMMIT on one connection reject the
+     * overlap with "cannot start a transaction within a transaction".
+     */
     async claim(
       id: string,
       processingToken: string,
@@ -200,39 +203,33 @@ export function createSQLiteUploadStorage(options: SQLiteUploadStorageOptions): 
     ): Promise<UploadTask | null> {
       const driver = await ensureReady();
 
-      return driver.transaction(async (tx) => {
-        const current = await tx.execute(`SELECT * FROM upload_queue WHERE id = ? LIMIT 1`, [id]);
-        const row = current.rows[0];
-        if (!row || String(row.status) !== 'pending') {
-          return null;
-        }
+      const result = await driver.execute(
+        `UPDATE upload_queue
+         SET status = 'uploading',
+             processing_token = ?,
+             processing_started_at = ?,
+             started_at = COALESCE(started_at, ?),
+             updated_at = ?,
+             next_attempt_at = NULL,
+             progress = 0,
+             bytes_uploaded = 0
+         WHERE id = ?
+           AND status = 'pending'
+           AND (next_attempt_at IS NULL OR next_attempt_at <= ?)`,
+        [processingToken, nowIso, nowIso, nowIso, id, nowIso],
+      );
 
-        if (row.next_attempt_at != null && String(row.next_attempt_at) > nowIso) {
-          return null;
-        }
+      if ((result.rowsAffected ?? 0) === 0) {
+        return null;
+      }
 
-        const result = await tx.execute(
-          `UPDATE upload_queue
-           SET status = 'uploading',
-               processing_token = ?,
-               processing_started_at = ?,
-               started_at = COALESCE(started_at, ?),
-               updated_at = ?,
-               next_attempt_at = NULL,
-               progress = 0,
-               bytes_uploaded = 0
-           WHERE id = ? AND status = 'pending'`,
-          [processingToken, nowIso, nowIso, nowIso, id],
-        );
-
-        if (result.rowsAffected === 0) {
-          return null;
-        }
-
-        const claimed = await tx.execute(`SELECT * FROM upload_queue WHERE id = ? LIMIT 1`, [id]);
-        const claimedRow = claimed.rows[0];
-        return claimedRow ? mapUploadRow(claimedRow) : null;
-      });
+      // Read back through the token so the row we return is provably ours.
+      const claimed = await driver.execute(
+        `SELECT * FROM upload_queue WHERE id = ? AND processing_token = ? LIMIT 1`,
+        [id, processingToken],
+      );
+      const claimedRow = claimed.rows[0];
+      return claimedRow ? mapUploadRow(claimedRow) : null;
     },
 
     async delete(id: string): Promise<void> {
@@ -251,8 +248,11 @@ export function createSQLiteUploadStorage(options: SQLiteUploadStorageOptions): 
     async deleteCompleted(olderThanIso?: string): Promise<number> {
       const driver = await ensureReady();
       if (olderThanIso) {
+        // Ages by when the upload finished, not when the row was last touched:
+        // any later write used to bump updated_at and rescue the row from purging.
         const result = await driver.execute(
-          `DELETE FROM upload_queue WHERE status = 'completed' AND updated_at <= ?`,
+          `DELETE FROM upload_queue
+           WHERE status = 'completed' AND COALESCE(completed_at, updated_at) <= ?`,
           [olderThanIso],
         );
         return result.rowsAffected ?? 0;

@@ -19,6 +19,18 @@ jobs:
           registry-url: https://registry.npmjs.org
           cache: npm
       - run: npm ci
+
+      # Nothing else ties the tag to the manifest: tagging v0.2.0 while
+      # package.json still says 0.1.0 would publish 0.1.0 without complaining.
+      - name: Verify the tag matches package.json
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+
       - run: npm run check:full
       - run: npm publish --access public --provenance
         env:

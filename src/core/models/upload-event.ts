@@ -26,6 +26,8 @@ export interface UploadCompletedEvent {
   readonly uploadId: string;
   readonly remoteId?: string;
   readonly attempts: number;
+  /** Parsed server response for the successful attempt, when the server sent one. */
+  readonly response?: unknown;
 }
 
 export interface UploadRetryScheduledEvent {

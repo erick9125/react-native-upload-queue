@@ -32,6 +32,38 @@ export function createMemoryUploadStorage(): UploadStorage {
       tasks.set(task.id, cloneTask(task));
     },
 
+    async updateOwned(task: UploadTask, processingToken: string): Promise<boolean> {
+      const current = tasks.get(task.id);
+      if (!current || current.processingToken !== processingToken) {
+        return false;
+      }
+
+      tasks.set(task.id, cloneTask(task));
+      return true;
+    },
+
+    async updateProgress(update): Promise<boolean> {
+      const current = tasks.get(update.id);
+      if (
+        !current ||
+        current.status !== 'uploading' ||
+        current.processingToken !== update.processingToken
+      ) {
+        return false;
+      }
+
+      tasks.set(
+        update.id,
+        cloneTask(current, {
+          progress: update.progress,
+          bytesUploaded: update.bytesUploaded,
+          updatedAt: update.updatedAt,
+          ...(update.totalBytes !== undefined ? { totalBytes: update.totalBytes } : {}),
+        }),
+      );
+      return true;
+    },
+
     async get(id: string): Promise<UploadTask | null> {
       const task = tasks.get(id);
       return task ? cloneTask(task) : null;
@@ -53,15 +85,58 @@ export function createMemoryUploadStorage(): UploadStorage {
         .map((task) => cloneTask(task));
     },
 
-    async getRecoverable(staleBeforeIso: string): Promise<readonly UploadTask[]> {
-      return [...tasks.values()]
+    async getRecoverable(staleBeforeIso: string, limit?: number): Promise<readonly UploadTask[]> {
+      const recoverable = [...tasks.values()]
         .filter(
           (task) =>
             task.status === 'uploading' &&
             task.processingStartedAt !== undefined &&
             task.processingStartedAt <= staleBeforeIso,
         )
-        .map((task) => cloneTask(task));
+        .sort((left, right) =>
+          (left.processingStartedAt ?? '').localeCompare(right.processingStartedAt ?? ''),
+        );
+
+      return (limit === undefined ? recoverable : recoverable.slice(0, limit)).map((task) =>
+        cloneTask(task),
+      );
+    },
+
+    async recoverAbandoned(staleBeforeIso: string, updatedAt: string): Promise<number> {
+      let recovered = 0;
+      for (const [id, task] of tasks.entries()) {
+        if (
+          task.status !== 'uploading' ||
+          task.processingStartedAt === undefined ||
+          task.processingStartedAt > staleBeforeIso
+        ) {
+          continue;
+        }
+
+        tasks.set(
+          id,
+          cloneTask(task, { status: 'pending', updatedAt, progress: 0 }, [
+            'processingToken',
+            'processingStartedAt',
+            'nextAttemptAt',
+          ]),
+        );
+        recovered += 1;
+      }
+      return recovered;
+    },
+
+    async getEarliestNextAttemptAt(): Promise<string | null> {
+      let earliest: string | undefined;
+      for (const task of tasks.values()) {
+        if (task.status !== 'pending' || !task.nextAttemptAt) {
+          continue;
+        }
+        if (earliest === undefined || task.nextAttemptAt < earliest) {
+          earliest = task.nextAttemptAt;
+        }
+      }
+      return earliest ?? null;
     },
 
     async claim(id: string, processingToken: string, nowIsoValue: string): Promise<UploadTask | null> {
@@ -107,7 +182,8 @@ export function createMemoryUploadStorage(): UploadStorage {
         if (task.status !== 'completed') {
           continue;
         }
-        if (olderThanIso && task.updatedAt > olderThanIso) {
+        // Ages by when the upload finished, not when the row was last touched.
+        if (olderThanIso && (task.completedAt ?? task.updatedAt) > olderThanIso) {
           continue;
         }
         tasks.delete(id);

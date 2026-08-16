@@ -21,6 +21,9 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm run test
+      # Coverage, not plain test: vitest.config.ts declares 90% thresholds and
+      # `npm run test` does not enforce them, so they never actually gated CI.
+      - run: npm run test:coverage
       - run: npm run build
       - run: npm run verify:package
+      - run: npm audit --audit-level=high

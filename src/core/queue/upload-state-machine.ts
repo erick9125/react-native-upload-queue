@@ -2,7 +2,10 @@ import { InvalidUploadStateError } from '../../errors/invalid-upload-state.error
 import type { UploadStatus } from '../models/upload-status.js';
 
 const TRANSITIONS: Readonly<Record<UploadStatus, readonly UploadStatus[]>> = {
-  pending: ['uploading', 'paused', 'cancelled'],
+  // `pending -> pending` keeps retry() usable on an upload that is already
+  // queued: it resets the attempt counter, which is a meaningful request even
+  // when the status does not change. resume() short-circuits the same case.
+  pending: ['uploading', 'paused', 'cancelled', 'pending'],
   uploading: ['completed', 'pending', 'paused', 'blocked', 'failed', 'cancelled'],
   paused: ['pending', 'cancelled'],
   blocked: ['pending', 'failed', 'cancelled'],
