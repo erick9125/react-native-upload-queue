@@ -1,6 +1,26 @@
 {
   "name": "upload-queue-example-app",
-  "private": true,
   "version": "0.1.0",
-  "main": "App.tsx"
+  "private": true,
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios"
+  },
+  "dependencies": {
+    "@erickmorales91/react-native-upload-queue": "file:../../erickmorales91-react-native-upload-queue-0.1.0.tgz",
+    "@react-native-community/netinfo": "11.4.1",
+    "expo": "~52.0.0",
+    "expo-image-picker": "~16.0.6",
+    "expo-sqlite": "~15.0.7",
+    "expo-status-bar": "~2.0.1",
+    "react": "18.3.1",
+    "react-native": "0.76.9"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.25.2",
+    "@types/react": "~18.3.12",
+    "typescript": "~5.3.3"
+  }
 }
